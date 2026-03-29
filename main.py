@@ -633,3 +633,114 @@ def recommend(request: RecommendRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Recommendation error: {str(e)}")
+
+# =========================
+# 13. PROJECT-BASED RECOMMENDATIONS (NEW)
+# =========================
+
+class Project(BaseModel):
+    project_id: str
+    title: str
+    skills: str = ""
+    text: str = ""
+    experience_level: str = ""
+    employment_type: str = ""
+    city: str = ""
+    category: Optional[str] = ""
+    budget_min: Optional[float] = 0
+    budget_max: Optional[float] = 0
+
+
+class RecommendProjectsRequest(BaseModel):
+    skills: str
+    interests: Optional[str] = ""
+    experience: Optional[str] = ""
+    employment: Optional[str] = ""
+    city: Optional[str] = ""
+    top_n: Optional[int] = 10
+    projects: List[Project]
+
+
+@app.post("/recommend-projects")
+def recommend_projects(request: RecommendProjectsRequest):
+    try:
+        # === 1. student profile ===
+        student_profile = build_student_profile_dict(
+            skills=request.skills,
+            interests=request.interests or "",
+            experience=request.experience or "",
+            employment=request.employment or "",
+            city=request.city or "",
+        )
+
+        # === 2. projects → DataFrame ===
+        if not request.projects:
+            return {"recommendations": []}
+
+        df = pd.DataFrame([p.dict() for p in request.projects])
+
+        # нормализация колонок
+        df["job_title"] = df["title"]
+        df["skills"] = df["skills"].fillna("")
+        df["text"] = df["text"].fillna("")
+        df["experience_level"] = df["experience_level"].fillna("")
+        df["employment_type"] = df["employment_type"].fillna("")
+        df["city"] = df["city"].fillna("")
+        df["job_family"] = df["category"].fillna("other")
+
+        # чистка
+        df["experience_clean"] = df["experience_level"].apply(normalize_experience)
+        df["employment_clean"] = df["employment_type"].apply(normalize_employment)
+        df["city_clean"] = df["city"].apply(normalize_city)
+
+        # === 3. candidate similarity ===
+        df["candidate_similarity"] = df.apply(
+            lambda row: compute_candidate_similarity(
+                student_skills=student_profile["student_skills"],
+                student_interests=student_profile["student_interests"],
+                vacancy_title=row["job_title"],
+                vacancy_skills=row["skills"],
+                vacancy_text=row["text"],
+            ),
+            axis=1
+        )
+
+        # === 4. feature engineering ===
+        feature_df = build_ranker_features(student_profile, df)
+        feature_df = feature_df[RANKER_FEATURE_COLS].fillna(0)
+
+        # === 5. ranking ===
+        rank_scores = ranker.predict(feature_df)
+
+        df["rank_score"] = rank_scores
+        df = apply_business_adjustments(student_profile, df)
+
+        df = df.sort_values(
+            by=["final_score", "candidate_similarity"],
+            ascending=[False, False]
+        ).head(request.top_n or 10)
+
+        # === 6. response ===
+        results = []
+        for _, row in df.iterrows():
+            results.append({
+                "project_id": str(row.get("project_id", "")),
+                "title": safe_str(row.get("title", "")),
+                "text": safe_str(row.get("text", "")),
+                "city": safe_str(row.get("city", "")),
+                "employment_type": safe_str(row.get("employment_type", "")),
+                "experience_level": safe_str(row.get("experience_level", "")),
+                "category": safe_str(row.get("category", "")),
+                "budget_min": safe_float(row.get("budget_min", 0)),
+                "budget_max": safe_float(row.get("budget_max", 0)),
+                "final_score": round(safe_float(row.get("final_score", 0.0)), 4),
+                "match_reason": build_match_reason(student_profile, row),
+            })
+
+        return {
+            "count": len(results),
+            "recommendations": results
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
