@@ -1,8 +1,8 @@
 fastapi
-uvicorn[standard]
+uvicorn
 pandas
 openpyxl
-sentence-transformers
 scikit-learn
-torch
+catboost
+joblib
 pydantic
