@@ -6,3 +6,5 @@ scikit-learn
 catboost
 joblib
 pydantic
+numpy
+sentence-transformers
