@@ -516,7 +516,7 @@ def build_ranker_features(student_profile: dict, candidates_df: pd.DataFrame) ->
 # Чистая heuristic-оценка для адаптивного блендинга
 # =========================
 def compute_pure_heuristic(student_profile: dict, row: pd.Series) -> float:
-    """Возвращает score в [0, 1] на основе правил без ML."""
+    """Возвращает score; может быть отрицательным при сильном несоответствии уровня."""
     s_skills = set(normalize_skill_list(student_profile["student_skills"]))
     v_skills = set(normalize_skill_list(safe_str(row.get("skills", ""))))
 
@@ -526,14 +526,34 @@ def compute_pure_heuristic(student_profile: dict, row: pd.Series) -> float:
         bool(student_profile["student_city"]) and
         normalize_city(safe_str(row.get("city", ""))) == student_profile["student_city"]
     )
-    exp_score = float(
-        bool(student_profile["student_experience"]) and
-        normalize_experience(safe_str(row.get("experience_level", ""))) == student_profile["student_experience"]
-    )
-    emp_score = float(
-        bool(student_profile["student_employment"]) and
-        normalize_employment(safe_str(row.get("employment_type", ""))) == student_profile["student_employment"]
-    )
+
+    # Experience: совпадение +1.0, нейтрально 0.5, превышение −0.5 / −1.0
+    s_exp = student_profile["student_experience"]
+    v_exp = normalize_experience(safe_str(row.get("experience_level", "")))
+    if not s_exp or not v_exp:
+        exp_score = 0.5   # нет данных — нейтрально
+    elif s_exp == v_exp:
+        exp_score = 1.0   # точное попадание
+    else:
+        gap = experience_to_num(v_exp) - experience_to_num(s_exp)
+        if gap == 1:
+            exp_score = -0.5   # junior → middle: умеренный штраф
+        elif gap >= 2:
+            exp_score = -1.0   # junior → senior: сильный штраф
+        else:
+            exp_score = 0.7    # переквалификация (middle → junior): небольшой минус
+
+    # Employment: совпадение +1.0, жёсткий конфликт (хочу remote, есть офис) −0.5
+    s_emp = student_profile["student_employment"]
+    v_emp = normalize_employment(safe_str(row.get("employment_type", "")))
+    if not s_emp or not v_emp:
+        emp_score = 0.5
+    elif s_emp == v_emp:
+        emp_score = 1.0
+    elif s_emp in ("remote", "part-time") and v_emp == "full-time":
+        emp_score = -0.5   # студент хочет remote/part-time, а вакансия требует офис
+    else:
+        emp_score = 0.3    # мягкое несоответствие
 
     return 0.60 * skill_score + 0.20 * city_score + 0.10 * exp_score + 0.10 * emp_score
 
@@ -639,6 +659,30 @@ def apply_business_adjustments(student_profile: dict, result_df: pd.DataFrame) -
     # --- Бонус за наличие зарплаты (небольшой, 0.03) ---
     if "has_salary" in result_df.columns:
         result_df["final_score"] += 0.03 * result_df["has_salary"]
+
+    # --- Штраф за несоответствие уровня опыта [НОВОЕ] ---
+    # junior → middle:  -0.25
+    # junior → senior:  -0.50
+    s_exp_num = experience_to_num(student_profile["student_experience"])
+    if s_exp_num > 0:   # применяем только когда уровень указан
+        vac_exp_nums = result_df.apply(
+            lambda row: experience_to_num(
+                normalize_experience(safe_str(row.get("experience_level", "")))
+            ),
+            axis=1,
+        )
+        exp_gap_vec = vac_exp_nums - s_exp_num
+        result_df.loc[exp_gap_vec == 1,  "final_score"] -= 0.25
+        result_df.loc[exp_gap_vec >= 2,  "final_score"] -= 0.50
+
+    # --- Штраф за формат (хочу remote/part-time, а вакансия — офис) [НОВОЕ] ---
+    s_emp = student_profile["student_employment"]
+    if s_emp in ("remote", "part-time"):
+        vac_emp_vec = result_df.apply(
+            lambda row: normalize_employment(safe_str(row.get("employment_type", ""))),
+            axis=1,
+        )
+        result_df.loc[vac_emp_vec == "full-time", "final_score"] -= 0.20
 
     # --- Штраф за teaching-роли (без изменений) ---
     user_text = clean_text(
